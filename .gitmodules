@@ -1,0 +1,9 @@
+[submodule "OpenLineage"]
+	path = OpenLineage
+	url = https://github.com/OpenLineage/OpenLineage.git
+[submodule "marquez"]
+	path = marquez
+	url = https://github.com/MarquezProject/marquez.git
+[submodule "lineage-demo-pipeline"]
+	path = lineage-demo-pipeline
+	url = https://github.com/rh-waterford-et/lineage-demo-pipeline.git
