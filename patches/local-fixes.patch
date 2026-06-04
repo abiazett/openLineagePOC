@@ -11,7 +11,7 @@ index a533d41..45fc115 100644
  
  COPY src/ src/
 diff --git a/docker-compose.yml b/docker-compose.yml
-index 42bf4f9..0edbade 100644
+index 42bf4f9..00295c1 100644
 --- a/docker-compose.yml
 +++ b/docker-compose.yml
 @@ -73,13 +73,14 @@ services:
@@ -26,7 +26,7 @@ index 42bf4f9..0edbade 100644
        AWS_ACCESS_KEY_ID: minioadmin
        AWS_SECRET_ACCESS_KEY: minioadmin
        MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-+      MLFLOW_ALLOWED_HOSTS: "mlflow,mlflow:5000"
++      MLFLOW_ALLOWED_HOSTS: "mlflow,mlflow:5000,localhost,localhost:5050"
      depends_on:
        postgres:
          condition: service_healthy
@@ -34,7 +34,7 @@ index 42bf4f9..0edbade 100644
        --default-artifact-root s3://mlflow-artifacts/
        --host 0.0.0.0
        --port 5000
-+      --allowed-hosts "mlflow,mlflow:5000"
++      --allowed-hosts "mlflow,mlflow:5000,localhost,localhost:5050"
      healthcheck:
        test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
        interval: 10s
@@ -47,7 +47,7 @@ index 42bf4f9..0edbade 100644
      environment:
        FEAST_REPO_PATH: /app/src/feature_store
        MLFLOW_TRACKING_URI: http://mlflow:5000
-@@ -114,6 +116,11 @@ services:
+@@ -114,12 +116,71 @@ services:
        REDIS_HOST: redis
        REDIS_PORT: 6379
        MODEL_NAME: customer_churn_model
@@ -59,3 +59,314 @@ index 42bf4f9..0edbade 100644
      depends_on:
        redis:
          condition: service_healthy
+       mlflow:
+         condition: service_healthy
+ 
++  # ── Marquez Lineage Backend ────────────────────────────────────────────
++  marquez-db:
++    image: postgres:14
++    container_name: marquez-db
++    ports:
++      - "5433:5432"
++    environment:
++      POSTGRES_USER: postgres
++      POSTGRES_PASSWORD: password
++      MARQUEZ_DB: marquez
++      MARQUEZ_USER: marquez
++      MARQUEZ_PASSWORD: marquez
++    volumes:
++      - marquez_db_data:/var/lib/postgresql/data
++      - ../marquez/docker/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
++      - ../marquez/docker/postgresql.conf:/etc/postgresql/postgresql.conf
++    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U postgres"]
++      interval: 5s
++      timeout: 3s
++      retries: 10
++
++  marquez-api:
++    image: marquezproject/marquez:0.51.1
++    container_name: marquez-api
++    ports:
++      - "5002:5000"
++      - "5001:5001"
++    environment:
++      MARQUEZ_PORT: 5000
++      MARQUEZ_ADMIN_PORT: 5001
++      POSTGRES_HOST: marquez-db
++      SEARCH_ENABLED: "false"
++    volumes:
++      - ../marquez/docker/wait-for-it.sh:/opt/marquez/wait-for-it.sh
++    depends_on:
++      marquez-db:
++        condition: service_healthy
++    entrypoint: ["/opt/marquez/wait-for-it.sh", "marquez-db:5432", "--", "./entrypoint.sh"]
++
++  marquez-web:
++    image: marquezproject/marquez-web:0.51.1
++    container_name: marquez-web
++    environment:
++      MARQUEZ_HOST: marquez-api
++      MARQUEZ_PORT: 5000
++      WEB_PORT: 3000
++    ports:
++      - "3000:3000"
++    depends_on:
++      - marquez-api
++
+ volumes:
+   minio_data:
+   pg_data:
++  marquez_db_data:
+diff --git a/src/etl/run_etl.py b/src/etl/run_etl.py
+index a8941f9..fcf5000 100644
+--- a/src/etl/run_etl.py
++++ b/src/etl/run_etl.py
+@@ -4,9 +4,12 @@ STAGE 1  –  End-to-end ETL orchestrator (pandas / MinIO client → PostgreSQL)
+ Used by ``scripts/run_all.sh`` and local jobs. For OpenShift / KFP, the
+ platform step runs ``spark_etl.py`` (PySpark + OpenLineage listener) instead;
+ transform logic is intentionally parallel, not shared, between the two stacks.
++
++When OPENLINEAGE_URL is set, emits real OpenLineage events for each sub-step.
+ """
+ 
+ import logging
++import os
+ import sys
+ from pathlib import Path
+ 
+@@ -32,8 +35,58 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _get_emitter():
++    if not os.environ.get("OPENLINEAGE_URL"):
++        return None
++    try:
++        from openlineage_oai.core.emitter import OpenLineageEmitter, generate_run_id
++        from openlineage_oai.core.config import OpenLineageConfig
++        config = OpenLineageConfig.from_env()
++        config.namespace = os.environ.get("OPENLINEAGE_NAMESPACE", "demo-pipeline")
++        return OpenLineageEmitter(config)
++    except Exception:
++        return None
++
++
++def _schema_facet(columns):
++    return {
++        "schema": {
++            "_producer": "https://github.com/rh-waterford-et/lineage-demo-pipeline",
++            "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
++            "fields": columns,
++        }
++    }
++
++
++RAW_SCHEMA = [
++    {"name": "entity_id", "type": "INTEGER"},
++    {"name": "tenure_months", "type": "FLOAT"},
++    {"name": "monthly_charges", "type": "FLOAT"},
++    {"name": "total_charges", "type": "FLOAT"},
++    {"name": "num_support_tickets", "type": "INTEGER"},
++    {"name": "contract_type", "type": "VARCHAR"},
++    {"name": "internet_service", "type": "VARCHAR"},
++    {"name": "payment_method", "type": "VARCHAR"},
++    {"name": "churn", "type": "INTEGER"},
++    {"name": "event_timestamp", "type": "TIMESTAMP"},
++]
++
++NS = "demo-pipeline"
++
++
++def _emit_step(emitter, job_name, inputs, outputs):
++    if not emitter:
++        return
++    from openlineage_oai.core.emitter import generate_run_id
++    run_id = generate_run_id()
++    emitter.emit_start(run_id, job_name, inputs=inputs, outputs=outputs)
++    emitter.emit_complete(run_id, job_name, inputs=inputs, outputs=outputs)
++    logger.info("  ↳ OL events emitted for %s", job_name)
++
++
+ def run() -> None:
+     logger.info("═══ STAGE 1 – ETL START ═══")
++    emitter = _get_emitter()
+ 
+     # ── Extract ──────────────────────────────────────────────────────────
+     raw_df = extract_from_minio(
+@@ -44,12 +97,27 @@ def run() -> None:
+         object_name=RAW_CSV_OBJECT,
+         secure=MINIO_SECURE,
+     )
++    _emit_step(
++        emitter, "etl.extract",
++        inputs=[{"namespace": NS, "name": f"s3://{MINIO_BUCKET}/{RAW_CSV_OBJECT}", "facets": _schema_facet(RAW_SCHEMA)}],
++        outputs=[{"namespace": NS, "name": "etl.raw_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++    )
+ 
+     # ── Transform ────────────────────────────────────────────────────────
+     clean_df = transform(raw_df)
++    _emit_step(
++        emitter, "etl.transform",
++        inputs=[{"namespace": NS, "name": "etl.raw_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++        outputs=[{"namespace": NS, "name": "etl.clean_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++    )
+ 
+     # ── Load ─────────────────────────────────────────────────────────────
+     load_to_postgres(clean_df, PG_URL, WAREHOUSE_TABLE)
++    _emit_step(
++        emitter, "etl.load",
++        inputs=[{"namespace": NS, "name": "etl.clean_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++        outputs=[{"namespace": NS, "name": f"postgresql://postgres:5432/warehouse.{WAREHOUSE_TABLE}", "facets": _schema_facet(RAW_SCHEMA)}],
++    )
+ 
+     logger.info("═══ STAGE 1 – ETL COMPLETE ═══")
+ 
+diff --git a/src/pipeline/run_pipeline.py b/src/pipeline/run_pipeline.py
+index 412bb72..9d505f7 100644
+--- a/src/pipeline/run_pipeline.py
++++ b/src/pipeline/run_pipeline.py
+@@ -5,9 +5,12 @@ This script runs all six steps locally (no KFP). The same
+ ``src.pipeline.components`` functions are invoked from thin ``kfp_pipeline``
+ ``@dsl.component`` bodies on the cluster (plus GX validation in
+ ``gx_churn_validation`` for the KFP path only).
++
++When OPENLINEAGE_URL is set, emits real OpenLineage events for each step.
+ """
+ 
+ import logging
++import os
+ import sys
+ from pathlib import Path
+ 
+@@ -36,9 +39,63 @@ from src.pipeline.components import (
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+ logger = logging.getLogger(__name__)
+ 
++NS = "demo-pipeline"
++
++RAW_SCHEMA = [
++    {"name": "entity_id", "type": "INTEGER"},
++    {"name": "tenure_months", "type": "FLOAT"},
++    {"name": "monthly_charges", "type": "FLOAT"},
++    {"name": "total_charges", "type": "FLOAT"},
++    {"name": "num_support_tickets", "type": "INTEGER"},
++    {"name": "contract_type", "type": "VARCHAR"},
++    {"name": "internet_service", "type": "VARCHAR"},
++    {"name": "payment_method", "type": "VARCHAR"},
++    {"name": "churn", "type": "INTEGER"},
++    {"name": "event_timestamp", "type": "TIMESTAMP"},
++]
++
++ENGINEERED_SCHEMA = RAW_SCHEMA + [
++    {"name": "charges_per_month", "type": "FLOAT"},
++    {"name": "ticket_rate", "type": "FLOAT"},
++]
++
++
++def _schema_facet(columns):
++    return {
++        "schema": {
++            "_producer": "https://github.com/rh-waterford-et/lineage-demo-pipeline",
++            "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
++            "fields": columns,
++        }
++    }
++
++
++def _get_emitter():
++    if not os.environ.get("OPENLINEAGE_URL"):
++        return None
++    try:
++        from openlineage_oai.core.emitter import OpenLineageEmitter
++        from openlineage_oai.core.config import OpenLineageConfig
++        config = OpenLineageConfig.from_env()
++        config.namespace = os.environ.get("OPENLINEAGE_NAMESPACE", NS)
++        return OpenLineageEmitter(config)
++    except Exception:
++        return None
++
++
++def _emit_step(emitter, job_name, inputs, outputs):
++    if not emitter:
++        return
++    from openlineage_oai.core.emitter import generate_run_id
++    run_id = generate_run_id()
++    emitter.emit_start(run_id, job_name, inputs=inputs, outputs=outputs)
++    emitter.emit_complete(run_id, job_name, inputs=inputs, outputs=outputs)
++    logger.info("  ↳ OL events emitted for %s", job_name)
++
+ 
+ def run() -> dict:
+     logger.info("═══ STAGE 3 – PIPELINE START ═══")
++    emitter = _get_emitter()
+ 
+     # STEP 1 — Data Extraction via Feast
+     df = data_extraction(
+@@ -46,12 +103,30 @@ def run() -> dict:
+         feast_repo_path=FEAST_REPO_PATH,
+         table_name=WAREHOUSE_TABLE,
+     )
++    _emit_step(
++        emitter, "pipeline.data_extraction",
++        inputs=[
++            {"namespace": NS, "name": f"postgresql://postgres:5432/warehouse.{WAREHOUSE_TABLE}", "facets": _schema_facet(RAW_SCHEMA)},
++            {"namespace": NS, "name": "feast://customer_features_view"},
++        ],
++        outputs=[{"namespace": NS, "name": "pipeline.training_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++    )
+ 
+     # STEP 2 — Data Validation
+     df = data_validation(df)
++    _emit_step(
++        emitter, "pipeline.data_validation",
++        inputs=[{"namespace": NS, "name": "pipeline.training_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++        outputs=[{"namespace": NS, "name": "pipeline.validated_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++    )
+ 
+     # STEP 3 — Feature Engineering
+     df = feature_engineering(df)
++    _emit_step(
++        emitter, "pipeline.feature_engineering",
++        inputs=[{"namespace": NS, "name": "pipeline.validated_dataframe", "facets": _schema_facet(RAW_SCHEMA)}],
++        outputs=[{"namespace": NS, "name": "pipeline.engineered_dataframe", "facets": _schema_facet(ENGINEERED_SCHEMA)}],
++    )
+ 
+     # STEP 4 — Model Training (+ MLflow logging)
+     train_result = model_training(
+@@ -59,9 +134,19 @@ def run() -> dict:
+         tracking_uri=MLFLOW_TRACKING_URI,
+         experiment_name=MLFLOW_EXPERIMENT_NAME,
+     )
++    _emit_step(
++        emitter, "training.xgboost_churn_model",
++        inputs=[{"namespace": NS, "name": "pipeline.engineered_dataframe", "facets": _schema_facet(ENGINEERED_SCHEMA)}],
++        outputs=[{"namespace": NS, "name": "s3://mlflow-artifacts/customer_churn_model"}],
++    )
+ 
+     # STEP 5 — Evaluation
+     metrics = evaluation(train_result, tracking_uri=MLFLOW_TRACKING_URI)
++    _emit_step(
++        emitter, "training.evaluation",
++        inputs=[{"namespace": NS, "name": "s3://mlflow-artifacts/customer_churn_model"}],
++        outputs=[{"namespace": NS, "name": "mlflow://customer_churn_model/metrics"}],
++    )
+ 
+     # STEP 6 — Conditional Model Registration
+     try:
+@@ -72,6 +157,14 @@ def run() -> dict:
+             tracking_uri=MLFLOW_TRACKING_URI,
+             roc_auc_threshold=MODEL_ROC_AUC_THRESHOLD,
+         )
++        _emit_step(
++            emitter, "training.model_registration",
++            inputs=[
++                {"namespace": NS, "name": "s3://mlflow-artifacts/customer_churn_model"},
++                {"namespace": NS, "name": "mlflow://customer_churn_model/metrics"},
++            ],
++            outputs=[{"namespace": NS, "name": f"mlflow://model-registry/{MODEL_NAME}@champion"}],
++        )
+     except Exception:
+         logger.exception("STEP 6  Model registration failed (non-fatal)")
+         reg_result = {"registered": False, "reason": "error"}

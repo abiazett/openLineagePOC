@@ -96,14 +96,38 @@ curl -X POST http://localhost:8080/predict \
 | MinIO Console | http://localhost:9001 | minioadmin / minioadmin |
 | MLflow | http://localhost:5050 | (none) |
 | Inference API (Swagger) | http://localhost:8080/docs | (none) |
+| Marquez Web (lineage) | http://localhost:3000 | (none) |
+| Marquez API | http://localhost:5002 | (none) |
+
+### 8. Start Marquez (lineage backend)
+
+Marquez services are included in the docker-compose and start automatically with the other infrastructure. Verify they're running:
+
+```bash
+curl http://localhost:5002/api/v1/namespaces
+```
+
+### 9. Emit lineage events
+
+```bash
+python scripts/emit_lineage.py
+```
+
+This sends OpenLineage events for every pipeline stage to Marquez, creating a full lineage graph.
+
+### 10. View lineage
+
+Open http://localhost:3000, select the `demo-pipeline` namespace, and click any job to see its inputs, outputs, and run history.
 
 ## What the patch fixes
 
-The `patches/local-fixes.patch` addresses three issues when running locally on macOS:
+The `patches/local-fixes.patch` addresses these issues when running locally on macOS:
 
 1. **MLflow port conflict** -- macOS AirPlay uses port 5000; remapped to 5050
 2. **MLflow DNS rebinding** -- MLflow 3.10+ rejects non-localhost Host headers; adds `--allowed-hosts`
 3. **Feast Docker networking** -- `feature_store.yaml` uses `localhost` which doesn't resolve inside containers; sed patches hostnames at startup
+4. **Marquez services** -- Adds marquez-db, marquez-api, and marquez-web to docker-compose for lineage visualization
+5. **Lineage emission script** -- Adds `scripts/emit_lineage.py` to populate Marquez with pipeline lineage events
 
 ## Documentation
 
